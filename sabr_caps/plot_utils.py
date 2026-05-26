@@ -495,18 +495,6 @@ def plot_beta_comparison(smiles: list, yield_curve, label: str):
 
     # Graphe 3 : paramètres calibrés
     ax = axes[2]
-    param_names = ['α', 'ρ', 'ν', 'RMSE\n(bps)']
-    param_vals  = [
-        [p.alpha   for p in params_list],
-        [p.rho     for p in params_list],
-        [p.nu      for p in params_list],
-        [p.rmse*10000 for p in params_list],
-    ]
-    x = np.arange(len(betas))
-    for i, (name, vals) in enumerate(zip(param_names, param_vals)):
-        ax2_twin = ax if i == 0 else ax.twinx() if i == 3 else ax
-        pass
-
     # Tableau simple
     table_data = []
     lbls_table = ['β=0', 'β=0.5', 'β=1', f'β libre']
