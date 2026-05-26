@@ -1,517 +1,536 @@
 """
 plot_utils.py
 -------------
-Matplotlib visualisation helpers for the SABR calibration notebook.
+Fonctions graphiques pour la calibration SABR — Caps & Floors USD 2016.
 
-All heavy plotting code lives here so the notebook cells reduce to a
-single function call each.
-
-Public API
-----------
-  sort_index_numeric(df)
-  plot_sabr_params_tables(summary)
-  plot_sabr_heatmaps(summary)
-  plot_all_smiles(surface, vol_surface)
-  plot_rmse(summary, beta)
-  plot_individual_smile(surface, vol_surface, expiry, tenor)
-  plot_price_vega_smile(surface, vol_surface, yc,
-                        expiry, tenor, strike_bps,
-                        notional, option_type)
-  plot_beta_comparison(vol_surface, yc, expiry, tenor, betas, n_restarts)
+API publique
+------------
+  plot_yield_curve(yield_curve)
+  plot_vol_surface_overview(raw_vol_df, strikes_all)
+  plot_sabr_params_term_structure(summary_df)
+  plot_all_smiles(surface, smiles)
+  plot_rmse(summary_df, beta)
+  plot_individual_smile(surface, smiles, label)
+  plot_price_vega_smile(yield_curve, surface, label, K_bps, notional, type_)
+  plot_parity_verification(yield_curve, surface, T_mat)
+  plot_beta_comparison(smiles_raw_df, yield_curve, label)
 """
 
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
-from sabr        import sabr_vol_vec, calibrate_sabr, _parse_tenor
-from pricer      import swaption_price, black_greeks
-
-
-# --------------------------------------------------------------------------- #
-#  Utility                                                                      #
-# --------------------------------------------------------------------------- #
-
-def sort_index_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sort both rows and columns of a pivot DataFrame in ascending numeric order.
-
-    Labels are expected to end in 'y' or 'm'  (e.g. '5y', '10y', '6m').
-    """
-    def _key(label: str) -> float:
-        label = label.strip().lower()
-        if label.endswith("y"):
-            return float(label[:-1])
-        if label.endswith("m"):
-            return float(label[:-1]) / 12.0
-        return float(label)
-
-    row_order = sorted(df.index,   key=_key)
-    col_order = sorted(df.columns, key=_key)
-    return df.loc[row_order, col_order]
+import matplotlib.cm as cm
+from scipy.stats import norm
+from scipy.optimize import minimize
 
 
-# --------------------------------------------------------------------------- #
-#  Section 4 — parameter tables                                                 #
-# --------------------------------------------------------------------------- #
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def plot_sabr_params_tables(summary: pd.DataFrame) -> None:
-    """
-    Print pivot tables for α, ρ, ν and RMSE (%) sorted numerically.
-    """
-    for col, label in [
-        ("alpha", "α (alpha)"),
-        ("rho",   "ρ (rho)"),
-        ("nu",    "ν (nu)"),
-        ("rmse_%","RMSE (%)"),
+def _sabr_vol(F, K, T, alpha, beta, rho, nu, shift=0.01):
+    """SABR shifted — wrapper interne."""
+    from sabr import sabr_vol
+    return sabr_vol(F + shift, K + shift, T, alpha, beta, rho, nu)
+
+
+def _sabr_vol_vec(F, Ks, T, alpha, beta, rho, nu, shift=0.01):
+    return np.array([_sabr_vol(F, K, T, alpha, beta, rho, nu, shift) for K in Ks])
+
+
+def _calibrate_for_beta(F, T, strikes, mkt_vols, beta=0.0, shift=0.01, n_restarts=5):
+    """Calibre (alpha, rho, nu) pour un beta donné — version allégée."""
+    from sabr import calibrate_sabr
+    return calibrate_sabr(F, T, np.array(strikes), np.array(mkt_vols),
+                          beta=beta, shift=shift, n_restarts=n_restarts)
+
+
+COLORS = {
+    'sabr'  : '#185FA5',
+    'market': '#D85A30',
+    'zone'  : '#185FA5',
+    'rho'   : '#A32D2D',
+    'nu'    : '#3B6D11',
+    'alpha' : '#185FA5',
+    'rmse'  : '#854F0B',
+    'beta0' : '#185FA5',
+    'beta05': '#3B6D11',
+    'beta1' : '#A32D2D',
+}
+
+STYLE = {
+    'figure.facecolor': 'white',
+    'axes.facecolor'  : '#f8f9fa',
+    'axes.grid'       : True,
+    'grid.alpha'      : 0.3,
+    'axes.spines.top' : False,
+    'axes.spines.right': False,
+    'font.size'       : 10,
+}
+
+
+def _apply_style():
+    plt.rcParams.update(STYLE)
+
+
+# ── 1. Courbe OIS ─────────────────────────────────────────────────────────────
+
+def plot_yield_curve(yield_curve):
+    """Taux zéro-coupon et courbe forward bootstrappée."""
+    _apply_style()
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('Courbe OIS USD — 13 juillet 2016',
+                 fontsize=12, fontweight='bold')
+
+    T_plot = np.linspace(0.1, 30, 300)
+    ax1.plot(T_plot, yield_curve.zero_rate(T_plot)*100,
+             color=COLORS['sabr'], linewidth=2)
+    ax1.scatter(yield_curve._T, yield_curve.zero_rate(yield_curve._T)*100,
+                color=COLORS['market'], s=50, zorder=5, label='Piliers OIS observés')
+    ax1.set_xlabel('Maturité (années)')
+    ax1.set_ylabel('Taux zéro (%)')
+    ax1.set_title('Taux zéro-coupon\n(interpolation log-linéaire)')
+    ax1.legend(fontsize=9)
+
+    fwd_curve = yield_curve.forward_curve(delta=0.5, T_max=30)
+    ax2.plot(fwd_curve['T_end'], fwd_curve['F']*100,
+             'o-', color=COLORS['nu'], linewidth=1.8, markersize=3)
+    ax2.axhline(fwd_curve['F'].mean()*100, color='gray', linestyle='--',
+                linewidth=1, label=f"Moyenne = {fwd_curve['F'].mean()*100:.3f}%")
+    ax2.set_xlabel('Expiry caplet (années)')
+    ax2.set_ylabel('Taux forward LIBOR 6M (%)')
+    ax2.set_title('Taux forward LIBOR 6M bootstrappés\n(depuis courbe OIS — pas synthétiques)')
+    ax2.legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ── 2. Aperçu surface vol ─────────────────────────────────────────────────────
+
+def plot_vol_surface_overview(df_vol: pd.DataFrame, strikes_all: list):
+    """Smiles de vol et terme structure ATM."""
+    _apply_style()
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle("Surface de vol implicite — Caps USD (données réelles, 13 juillet 2016)",
+                 fontsize=12, fontweight='bold')
+
+    expiries_plot = ['1Y', '2Y', '3Y', '5Y', '7Y', '10Y', '15Y', '20Y', '30Y']
+    colors_p = cm.viridis(np.linspace(0, 1, len(expiries_plot)))
+
+    for exp, col in zip(expiries_plot, colors_p):
+        if exp in df_vol.index:
+            ax1.plot([s*100 for s in strikes_all], df_vol.loc[exp].values,
+                     linewidth=1.8, color=col, label=exp, marker='o', markersize=3)
+
+    ax1.set_xlabel('Strike (%)'); ax1.set_ylabel('Vol implicite (%)')
+    ax1.set_title('Smiles de vol par expiry\n(forme en U asymétrique — typique USD 2016)')
+    ax1.legend(fontsize=8, title='Expiry', ncol=2)
+
+    expiry_map2 = {'1Y':1,'2Y':2,'3Y':3,'5Y':5,'7Y':7,'10Y':10,
+                   '15Y':15,'20Y':20,'25Y':25,'30Y':30}
+    exp_T, vols_min = [], []
+    for lbl, T in expiry_map2.items():
+        if lbl in df_vol.index:
+            exp_T.append(T)
+            vols_min.append(df_vol.loc[lbl].min())
+
+    ax2.plot(exp_T, vols_min, 'o-', color=COLORS['sabr'], linewidth=2, markersize=6)
+    ax2.fill_between(exp_T, vols_min, alpha=0.08, color=COLORS['sabr'])
+    ax2.set_xlabel('Expiry (années)'); ax2.set_ylabel('Vol minimum (%)')
+    ax2.set_title('Terme structure de vol (vol ATM minimum)\nHump shape — vol courte élevée')
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ── 3. Terme structure des paramètres ─────────────────────────────────────────
+
+def plot_sabr_params_term_structure(summary: pd.DataFrame):
+    """Structure temporelle de (alpha, rho, nu, RMSE)."""
+    _apply_style()
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Structure temporelle des paramètres SABR calibrés\nCaps USD — données réelles juillet 2016',
+                 fontsize=12, fontweight='bold')
+
+    T_pl = summary['T (ans)'].values
+    lbls = summary['expiry'].values
+
+    for ax, col, key, title in [
+        (axes[0,0], COLORS['alpha'], 'alpha',   'α — volatilité initiale'),
+        (axes[0,1], COLORS['rho'],   'rho',     'ρ — corrélation (skew)'),
+        (axes[1,0], COLORS['nu'],    'nu',       'ν — vol of vol (wings)'),
+        (axes[1,1], COLORS['rmse'],  'rmse_%',  'RMSE calibration (%)'),
     ]:
-        pivot = summary.pivot(index="expiry", columns="tenor", values=col)
-        pivot = sort_index_numeric(pivot)
-        print(f"\n── {label} ──")
-        print(pivot.to_string())
+        vals = summary[key].values
+        ax.plot(T_pl, vals, 'o-', color=col, linewidth=2, markersize=7)
+        ax.fill_between(T_pl, vals, alpha=0.08, color=col)
+        for x, y, lbl in zip(T_pl, vals, lbls):
+            ax.annotate(lbl, (x, y), textcoords='offset points',
+                        xytext=(0, 8), fontsize=7.5, ha='center', color=col)
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        ax.set_xlabel('Expiry (années)')
 
-
-# --------------------------------------------------------------------------- #
-#  Section 5 — parameter heatmaps                                               #
-# --------------------------------------------------------------------------- #
-
-def plot_sabr_heatmaps(summary: pd.DataFrame) -> None:
-    """
-    3-panel heatmap: α, ρ, ν across the (expiry × tenor) surface.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    for ax, col, label in zip(
-        axes,
-        ["alpha", "rho", "nu"],
-        ["α (alpha)", "ρ (rho)", "ν (nu)"],
-    ):
-        pivot = sort_index_numeric(
-            summary.pivot(index="expiry", columns="tenor", values=col)
-        )
-        im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn_r")
-        ax.set_xticks(range(len(pivot.columns)))
-        ax.set_xticklabels(pivot.columns, rotation=45)
-        ax.set_yticks(range(len(pivot.index)))
-        ax.set_yticklabels(pivot.index)
-        ax.set_title(label, fontsize=13)
-        plt.colorbar(im, ax=ax)
-
-    fig.suptitle("SABR Parameter Heatmaps", fontsize=14)
-    fig.tight_layout()
+    plt.tight_layout()
     plt.show()
 
 
-# --------------------------------------------------------------------------- #
-#  Section 6 — all smiles (market vs. SABR)                                    #
-# --------------------------------------------------------------------------- #
+# ── 4. Toutes les smiles ──────────────────────────────────────────────────────
 
-def plot_all_smiles(surface, vol_surface: pd.DataFrame) -> None:
-    """
-    Grid of subplots — one per (expiry, tenor) slice — overlaying the
-    calibrated SABR smile against market implied vols.
-    """
-    pairs = list(surface.results.keys())
-    ncols = 4
-    nrows = -(-len(pairs) // ncols)   # ceiling division
+def plot_all_smiles(surface, smiles: list, df_vol: pd.DataFrame,
+                   strikes_all: list, n_cols: int = 3):
+    """Grille de smiles calibrées vs marché."""
+    _apply_style()
+    n = len(smiles)
+    n_rows = math.ceil(n / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 5*n_rows))
+    fig.suptitle('SABR Calibration — Caps USD (données réelles juillet 2016)\n'
+                 'Vol implicite SABR (—) vs marché réel (●)',
+                 fontsize=12, fontweight='bold')
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4))
-    axes_flat = axes.flatten()
+    axes_flat = axes.flatten() if n > 1 else [axes]
 
-    for ax, (expiry_str, tenor_str) in zip(axes_flat, pairs):
-        T   = _parse_tenor(expiry_str)
-        F   = surface.forward_rates[(expiry_str, tenor_str)]
-        p   = surface.results[(expiry_str, tenor_str)]
+    for ax, s in zip(axes_flat, smiles):
+        p = surface.get(s['label'])
+        if p is None:
+            ax.axis('off'); continue
+        F, T = s['F'], s['expiry']
 
-        mkt = vol_surface[
-            (vol_surface["expiry"] == expiry_str) &
-            (vol_surface["tenor"]  == tenor_str)
-        ].copy()
-        mkt["K"] = F + mkt["strike_spread_bps"] / 10_000.0
+        K_dense = np.linspace(0.001, 0.08, 200)
+        v_sabr  = [_sabr_vol(F, K, T, p.alpha, p.beta, p.rho, p.nu)*100 for K in K_dense]
 
-        K_grid     = np.linspace(mkt["K"].min() * 0.98, mkt["K"].max() * 1.02, 200)
-        model_vols = sabr_vol_vec(F, K_grid, T, p.alpha, p.beta, p.rho, p.nu)
+        all_vols = df_vol.loc[s['label']].values
+        ax.scatter([k*100 for k in strikes_all], all_vols,
+                   color='#cccccc', s=25, zorder=2, label='Marché (hors zone)')
+        ax.scatter([k*100 for k in s['strikes']],
+                   [v*100 for v in s['mkt_vols']],
+                   color=COLORS['market'], s=55, zorder=5,
+                   label='Marché (zone cal.)', edgecolors='white', linewidths=0.5)
+        ax.plot(K_dense*100, v_sabr,
+                color=COLORS['sabr'], linewidth=2.2, label='SABR calibré', zorder=4)
+        ax.axvline(F*100, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax.axvspan(0.5, 6.0, alpha=0.04, color=COLORS['zone'])
+        ax.set_xlim(0, 10)
+        ax.set_title(f"Cap {s['label']}  F={F*100:.3f}%  RMSE={p.rmse*10000:.1f}bps",
+                     fontsize=9, fontweight='bold')
+        ax.set_xlabel('Strike (%)', fontsize=8)
+        ax.set_ylabel('Vol (%)', fontsize=8)
+        ax.legend(fontsize=6.5, ncol=2)
 
-        ax.plot(K_grid * 100, model_vols * 100, "b-", lw=1.5, label="SABR")
-        ax.scatter(
-            mkt["K"] * 100, mkt["implied_vol"] * 100,
-            color="red", zorder=5, s=35, label="Marché",
-        )
-        ax.axvline(F * 100, ls="--", color="grey", lw=0.8)
-        ax.set_title(
-            f"{expiry_str} × {tenor_str}\n"
-            f"α={p.alpha:.4f}  ρ={p.rho:+.3f}  ν={p.nu:.4f}",
-            fontsize=9,
-        )
-        ax.set_xlabel("Strike (%)", fontsize=8)
-        ax.set_ylabel("Vol (%)", fontsize=8)
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=7)
+    for ax in axes_flat[len(smiles):]:
+        ax.axis('off')
 
-    for ax in axes_flat[len(pairs):]:
-        ax.set_visible(False)
-
-    fig.suptitle("SABR Smile Calibration — toutes les slices", fontsize=14, y=1.01)
-    fig.tight_layout()
+    plt.tight_layout()
     plt.show()
 
 
-# --------------------------------------------------------------------------- #
-#  Section 7 — RMSE comparison                                                  #
-# --------------------------------------------------------------------------- #
+# ── 5. RMSE ───────────────────────────────────────────────────────────────────
 
-def plot_rmse(summary: pd.DataFrame, beta: float) -> None:
-    """
-    Print the RMSE table sorted best → worst, then show a heatmap + bar chart.
-    """
-    rmse_df = summary[["expiry", "tenor", "rmse_%"]].copy()
-    rmse_df["_exp_y"] = rmse_df["expiry"].str.replace("y", "").astype(float)
-    rmse_df["_ten_y"] = rmse_df["tenor"].str.replace("y", "").astype(float)
-    rmse_df = (
-        rmse_df.sort_values("rmse_%")
-        .drop(columns=["_exp_y", "_ten_y"])
-        .reset_index(drop=True)
-    )
-    rmse_df.index += 1
+def plot_rmse(summary: pd.DataFrame, beta: float):
+    """Barplot RMSE + histogramme."""
+    _apply_style()
+    rmses = summary['rmse_%'].values * 100   # en bps
+    lbls  = summary['expiry'].values
 
-    print("RMSE par slice (du meilleur fit au moins bon) :")
-    print(rmse_df.to_string())
-    best_idx  = rmse_df["rmse_%"].idxmin()
-    worst_idx = rmse_df["rmse_%"].idxmax()
-    print(f"\nMoyenne : {rmse_df['rmse_%'].mean():.4f}%")
-    print(
-        f"Max     : {rmse_df['rmse_%'].max():.4f}%  "
-        f"({rmse_df.loc[worst_idx, 'expiry']} x {rmse_df.loc[worst_idx, 'tenor']})"
-    )
-    print(
-        f"Min     : {rmse_df['rmse_%'].min():.4f}%  "
-        f"({rmse_df.loc[best_idx, 'expiry']} x {rmse_df.loc[best_idx, 'tenor']})"
-    )
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f'Qualité de la calibration SABR (β={beta}) — RMSE par slice',
+                 fontsize=11, fontweight='bold')
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    bar_colors = ['#185FA5' if r < 20 else '#854F0B' if r < 100 else '#A32D2D'
+                  for r in rmses]
+    ax1.bar(range(len(rmses)), rmses, color=bar_colors, edgecolor='white', linewidth=0.5)
+    ax1.axhline(np.mean(rmses), color='black', linestyle='--', linewidth=1.2,
+                label=f'Moyenne = {np.mean(rmses):.1f} bps')
+    ax1.set_xticks(range(len(lbls)))
+    ax1.set_xticklabels(lbls, rotation=45, ha='right', fontsize=8)
+    ax1.set_ylabel('RMSE (bps)'); ax1.set_title('RMSE par expiry')
+    ax1.legend()
 
-    # ── Heatmap ──────────────────────────────────────────────────────────── #
-    ax1 = axes[0]
-    pivot_rmse = sort_index_numeric(
-        summary.pivot(index="expiry", columns="tenor", values="rmse_%")
-    )
-    im = ax1.imshow(pivot_rmse.values, aspect="auto", cmap="RdYlGn_r")
-    ax1.set_xticks(range(len(pivot_rmse.columns)))
-    ax1.set_xticklabels(pivot_rmse.columns, rotation=45)
-    ax1.set_yticks(range(len(pivot_rmse.index)))
-    ax1.set_yticklabels(pivot_rmse.index)
-    ax1.set_xlabel("Tenor", fontsize=11)
-    ax1.set_ylabel("Expiry", fontsize=11)
-    ax1.set_title("Heatmap RMSE (%)", fontsize=11)
-    plt.colorbar(im, ax=ax1)
+    ax2.hist(rmses, bins=8, color=COLORS['sabr'], alpha=0.75, edgecolor='white')
+    ax2.axvline(np.mean(rmses), color=COLORS['market'], linestyle='--',
+                linewidth=1.5, label=f'Moyenne = {np.mean(rmses):.1f} bps')
+    ax2.axvline(np.median(rmses), color=COLORS['nu'], linestyle='--',
+                linewidth=1.5, label=f'Médiane = {np.median(rmses):.1f} bps')
+    ax2.set_xlabel('RMSE (bps)'); ax2.set_ylabel('Fréquence')
+    ax2.set_title('Distribution des RMSE'); ax2.legend()
 
-    for i in range(len(pivot_rmse.index)):
-        for j in range(len(pivot_rmse.columns)):
-            val = pivot_rmse.values[i, j]
-            if not np.isnan(val):
-                ax1.text(
-                    j, i, f"{val:.3f}%",
-                    ha="center", va="center",
-                    fontsize=8, color="black", fontweight="bold",
-                )
-
-    # ── Bar chart ─────────────────────────────────────────────────────────── #
-    ax2 = axes[1]
-    labels_bar = [f"{r['expiry']}×{r['tenor']}" for _, r in rmse_df.iterrows()]
-    values_bar = rmse_df["rmse_%"].values
-    bar_colors = [
-        "#d73027" if v == values_bar.max()
-        else "#1a9850" if v == values_bar.min()
-        else "#74add1"
-        for v in values_bar
-    ]
-
-    bars = ax2.barh(labels_bar, values_bar, color=bar_colors, edgecolor="white", height=0.6)
-    for bar, val in zip(bars, values_bar):
-        ax2.text(
-            val + values_bar.max() * 0.01,
-            bar.get_y() + bar.get_height() / 2,
-            f"{val:.4f}%",
-            va="center", fontsize=9,
-        )
-    ax2.set_xlabel("RMSE (%)", fontsize=11)
-    ax2.set_title(
-        "RMSE par slice — du meilleur au moins bon\n"
-        "(vert = meilleur fit, rouge = moins bon fit)",
-        fontsize=11,
-    )
-    ax2.set_xlim(0, values_bar.max() * 1.18)
-    ax2.grid(True, axis="x", alpha=0.3)
-    ax2.invert_yaxis()
-
-    fig.suptitle(
-        f"Qualité de la calibration SABR (β={beta:.1f}) — RMSE par slice",
-        fontsize=13,
-    )
-    fig.tight_layout()
+    plt.tight_layout()
     plt.show()
 
 
-# --------------------------------------------------------------------------- #
-#  Section 8 — individual smile                                                 #
-# --------------------------------------------------------------------------- #
+# ── 6. Smile individuel ───────────────────────────────────────────────────────
 
-def plot_individual_smile(
-    surface,
-    vol_surface: pd.DataFrame,
-    expiry: str,
-    tenor: str,
-) -> None:
-    """
-    Plot a single SABR smile vs. market quotes for one (expiry, tenor) slice.
-    Also prints the forward rate and calibrated parameters.
-    """
-    T   = _parse_tenor(expiry)
-    F   = surface.forward_rates[(expiry, tenor)]
-    p   = surface.results[(expiry, tenor)]
+def plot_individual_smile(surface, smiles: list, df_vol: pd.DataFrame,
+                          strikes_all: list, label: str):
+    """Zoom sur une smile donnée avec résidus."""
+    _apply_style()
+    s = next((x for x in smiles if x['label'] == label), None)
+    p = surface.get(label)
+    if s is None or p is None:
+        print(f"Label {label} non trouvé."); return
 
-    mkt = vol_surface[
-        (vol_surface["expiry"] == expiry) &
-        (vol_surface["tenor"]  == tenor)
-    ].copy()
-    mkt["K"] = F + mkt["strike_spread_bps"] / 10_000.0
+    F, T = s['F'], s['expiry']
+    K_dense = np.linspace(0.001, 0.08, 300)
+    v_sabr  = np.array([_sabr_vol(F, K, T, p.alpha, p.beta, p.rho, p.nu)*100
+                        for K in K_dense])
 
-    K_grid     = np.linspace(mkt["K"].min() * 0.97, mkt["K"].max() * 1.03, 300)
-    model_vols = sabr_vol_vec(F, K_grid, T, p.alpha, p.beta, p.rho, p.nu)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f'Smile SABR détaillée — Cap {label}  |  F={F*100:.3f}%  |  β={p.beta}',
+                 fontsize=11, fontweight='bold')
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(K_grid * 100, model_vols * 100, "b-", lw=2, label="SABR model")
-    ax.scatter(
-        mkt["K"] * 100, mkt["implied_vol"] * 100,
-        color="red", zorder=5, s=60, label="Marché",
-    )
-    ax.axvline(F * 100, ls="--", color="grey", lw=1, label=f"ATM F={F:.3%}")
-    ax.set_xlabel("Strike (%)", fontsize=11)
-    ax.set_ylabel("Implied Vol (%)", fontsize=11)
-    ax.set_title(
-        f"SABR smile — Expiry {expiry}, Tenor {tenor}\n"
-        f"α={p.alpha:.5f}  β={p.beta:.2f}  ρ={p.rho:+.4f}  ν={p.nu:.5f}  "
-        f"RMSE={p.rmse * 100:.4f}%",
-        fontsize=11,
-    )
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    all_vols = df_vol.loc[label].values
+    ax1.scatter([k*100 for k in strikes_all], all_vols,
+                color='#cccccc', s=30, zorder=2, label='Marché (hors zone)')
+    ax1.scatter([k*100 for k in s['strikes']],
+                [v*100 for v in s['mkt_vols']],
+                color=COLORS['market'], s=70, zorder=5, label='Marché (zone calibrée)',
+                edgecolors='white', linewidths=0.8)
+    ax1.plot(K_dense*100, v_sabr, color=COLORS['sabr'],
+             linewidth=2.5, label=f'SABR  RMSE={p.rmse*10000:.1f}bps', zorder=4)
+    ax1.axvline(F*100, color='gray', linestyle='--', linewidth=0.8, alpha=0.7,
+                label=f'F={F*100:.3f}%')
+    ax1.axvspan(0.5, 6.0, alpha=0.05, color=COLORS['zone'], label='Zone calibrée')
+    ax1.set_xlim(0, 10)
+    ax1.set_xlabel('Strike (%)'); ax1.set_ylabel('Vol implicite (%)')
+    ax1.set_title('Smile — SABR vs marché'); ax1.legend(fontsize=8)
+
+    # Résidus sur la zone calibrée
+    K_arr = np.array(s['strikes'])
+    v_arr = np.array(s['mkt_vols'])
+    v_mod = np.array([_sabr_vol(F, K, T, p.alpha, p.beta, p.rho, p.nu) for K in K_arr])
+    resid = (v_mod - v_arr) * 10000  # en bps
+
+    ax2.bar(np.array(s['strikes'])*100, resid,
+            width=0.03, color=[COLORS['rho'] if r < 0 else COLORS['sabr'] for r in resid],
+            edgecolor='white')
+    ax2.axhline(0, color='black', linewidth=0.8)
+    ax2.set_xlabel('Strike (%)'); ax2.set_ylabel('Résidu SABR − marché (bps)')
+    ax2.set_title(f'Résidus (SABR − marché)  |  RMSE = {p.rmse*10000:.1f} bps')
+
+    plt.tight_layout()
     plt.show()
 
-    print(f"\nForward rate F = {F:.4%}")
-    print(
-        f"Paramètres SABR : alpha={p.alpha:.6f}, beta={p.beta}, "
-        f"rho={p.rho:.6f}, nu={p.nu:.6f}"
-    )
-    print(f"RMSE            : {p.rmse * 100:.4f}%")
+    print(f'\nParamètres calibrés — Cap {label}')
+    print(f'  alpha = {p.alpha:.6f}')
+    print(f'  beta  = {p.beta:.2f}  (fixé)')
+    print(f'  rho   = {p.rho:+.6f}')
+    print(f'  nu    = {p.nu:.6f}')
+    print(f'  RMSE  = {p.rmse*10000:.2f} bps')
 
 
-# --------------------------------------------------------------------------- #
-#  Section 10 — price / vega / smile vs. strike                                #
-# --------------------------------------------------------------------------- #
+# ── 7. Prix et vega en fonction du strike ─────────────────────────────────────
 
-def plot_price_vega_smile(
-    surface,
-    vol_surface: pd.DataFrame,
-    yc,
-    expiry: str,
-    tenor: str,
-    strike_bps: int,
-    notional: float,
-    option_type: str,
-) -> None:
-    """
-    3-panel figure showing the swaption price, vega, and SABR smile
-    as a function of strike (ATM ± 200 bps).
-    """
-    T_pr   = _parse_tenor(expiry)
-    ten_pr = _parse_tenor(tenor)
-    F_pr   = yc.swap_rate(T_pr, ten_pr)
-    A_pr   = yc.annuity(T_pr, ten_pr)
-    p_pr   = surface.results[(expiry, tenor)]
+def plot_price_vega_smile(yield_curve, surface, label: str,
+                          strike_bps: int = 0, notional: float = 1_000_000,
+                          type_: str = 'cap'):
+    """Prix, vega et vol SABR en fonction du strike."""
+    from pricer import black_caplet
+    _apply_style()
 
-    # ── Implied vol at the selected strike ─────────────────────────────────── #
-    K_pr = F_pr + strike_bps / 10_000.0
-    sigma_pr = sabr_vol_vec(
-        F_pr, np.array([K_pr]), T_pr,
-        p_pr.alpha, p_pr.beta, p_pr.rho, p_pr.nu,
-    )[0]
+    p = surface.get(label)
+    if p is None:
+        print(f'Label {label} non trouvé.'); return
 
-    # ── Grids ─────────────────────────────────────────────────────────────── #
-    bps_grid = np.linspace(-200, 200, 200)
-    K_grid   = F_pr + bps_grid / 10_000.0
+    T   = surface.expiries[label]
+    F   = surface.forward_rates[label]
+    P   = float(yield_curve.discount(T))
 
-    prices_grid = []
-    vegas_grid  = []
-    vols_grid   = []
+    K_ref = F + strike_bps / 10_000
+    Ks    = np.linspace(max(F - 0.03, 0.001), F + 0.04, 100)
 
-    for K_i in K_grid:
-        if K_i <= 0:
-            prices_grid.append(np.nan)
-            vegas_grid.append(np.nan)
-            vols_grid.append(np.nan)
-            continue
-        sig_i = sabr_vol_vec(
-            F_pr, np.array([K_i]), T_pr,
-            p_pr.alpha, p_pr.beta, p_pr.rho, p_pr.nu,
-        )[0]
-        price_i = swaption_price(F_pr, K_i, sig_i, T_pr, A_pr, notional, option_type)
-        greek_i = black_greeks(F_pr, K_i, sig_i, T_pr, A_pr, notional, option_type)
-        prices_grid.append(price_i)
-        vegas_grid.append(greek_i["vega_1pct"])
-        vols_grid.append(sig_i)
+    prices = []
+    vegas  = []
+    vols   = []
 
-    prices_grid = np.array(prices_grid)
-    vegas_grid  = np.array(vegas_grid)
-    vols_grid   = np.array(vols_grid)
+    for K in Ks:
+        sig = _sabr_vol(F, K, T, p.alpha, p.beta, p.rho, p.nu)
+        px  = black_caplet(F, K, sig, T, notional, 0.5, P, type_)
+        if sig > 0 and T > 0 and F > 0 and K > 0:
+            sqrtT = math.sqrt(T)
+            d1    = (math.log(F/K) + 0.5*sig**2*T)/(sig*sqrtT)
+            vg    = notional * 0.5 * P * F * norm.pdf(d1) * sqrtT * 0.01
+        else:
+            vg = 0.0
+        prices.append(px)
+        vegas.append(vg)
+        vols.append(sig * 100)
 
-    # ── Plot ──────────────────────────────────────────────────────────────── #
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle(f'Profils Prix, Vega et Vol — Cap {label}  |  F={F*100:.3f}%',
+                 fontsize=11, fontweight='bold')
 
-    axes[0].plot(bps_grid, prices_grid / 1000, "b-", lw=2)
-    axes[0].axvline(
-        strike_bps, ls="--", color="red", lw=1.2,
-        label=f"Strike sélectionné ({strike_bps:+d} bps)",
-    )
-    axes[0].axvline(0, ls=":", color="grey", lw=1, label="ATM")
-    axes[0].set_xlabel("Strike vs ATM (bps)")
-    axes[0].set_ylabel("Prix (k€)")
-    axes[0].set_title(f"Prix du swaption {option_type}\n{expiry} × {tenor}")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
+    for ax, vals, ylabel, title, col in [
+        (axes[0], prices, 'Prix ($)',        'Prix caplet vs strike',  COLORS['sabr']),
+        (axes[1], vegas,  'Vega ($/%vol)',   'Vega vs strike',         COLORS['rho']),
+        (axes[2], vols,   'Vol SABR (%)',    'Vol SABR vs strike',     COLORS['nu']),
+    ]:
+        ax.plot(Ks*100, vals, color=col, linewidth=2)
+        ax.axvline(F*100, color='gray', linestyle='--', linewidth=0.8,
+                   label=f'F={F*100:.3f}%')
+        ax.axvline(K_ref*100, color=COLORS['market'], linestyle=':',
+                   linewidth=1.5, label=f'K={K_ref*100:.3f}%')
+        ax.set_xlabel('Strike (%)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
 
-    axes[1].plot(bps_grid, vegas_grid / 1000, "g-", lw=2)
-    axes[1].axvline(strike_bps, ls="--", color="red", lw=1.2)
-    axes[1].axvline(0, ls=":", color="grey", lw=1)
-    axes[1].set_xlabel("Strike vs ATM (bps)")
-    axes[1].set_ylabel("Vega (k€ / +1% vol)")
-    axes[1].set_title("Vega en fonction du strike")
-    axes[1].grid(True, alpha=0.3)
-
-    axes[2].plot(bps_grid, vols_grid * 100, "purple", lw=2)
-    axes[2].axvline(
-        strike_bps, ls="--", color="red", lw=1.2,
-        label=f"σ = {sigma_pr:.2%}",
-    )
-    axes[2].axvline(0, ls=":", color="grey", lw=1)
-    axes[2].set_xlabel("Strike vs ATM (bps)")
-    axes[2].set_ylabel("Vol implicite SABR (%)")
-    axes[2].set_title("Smile SABR utilisé pour le pricing")
-    axes[2].legend(fontsize=8)
-    axes[2].grid(True, alpha=0.3)
-
-    fig.suptitle(
-        f"Swaption {option_type.upper()} — {expiry}×{tenor}  "
-        f"| F={F_pr:.3%}  A={A_pr:.4f}  Notionnel={notional:,.0f}€",
-        fontsize=11,
-    )
-    fig.tight_layout()
+    plt.tight_layout()
     plt.show()
 
 
-# --------------------------------------------------------------------------- #
-#  Section 12 — beta sensitivity comparison                                     #
-# --------------------------------------------------------------------------- #
+# ── 8. Parité Cap–Floor–Swap ──────────────────────────────────────────────────
 
-def plot_beta_comparison(
-    vol_surface: pd.DataFrame,
-    yc,
-    expiry: str,
-    tenor: str,
-    betas: list | None = None,
-    n_restarts: int = 8,
-) -> None:
+def plot_parity_verification(yield_curve, surface, T_mat: float = 5.0,
+                              notional: float = 1_000_000):
+    """Vérification graphique de la parité Cap − Floor = PV(Swap)."""
+    from pricer import cap_price
+    _apply_style()
+
+    Ks     = np.linspace(0.003, 0.07, 40)
+    caps_p = []
+    floors_p = []
+    swaps_p  = []
+
+    for K in Ks:
+        pc, _ = cap_price(yield_curve, surface, K, T_mat, notional)
+        ps    = yield_curve.pv_swap(K, 0.0, T_mat, 0.5, notional)
+        caps_p.append(pc)
+        swaps_p.append(ps)
+        floors_p.append(pc - ps)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f'Parité Cap − Floor = Swap  |  Maturité {T_mat}Y  |  Notional 1M USD',
+                 fontsize=11, fontweight='bold')
+
+    ax1.plot(Ks*100, [c/1000 for c in caps_p],
+             color=COLORS['sabr'], linewidth=2, label='Cap (k$)')
+    ax1.plot(Ks*100, [f/1000 for f in floors_p],
+             color=COLORS['market'], linewidth=2, label='Floor par parité (k$)')
+    ax1.set_xlabel('Strike (%)'); ax1.set_ylabel('Prix (k$)')
+    ax1.set_title('Prix Cap et Floor'); ax1.legend()
+
+    diff = [c - f for c, f in zip(caps_p, floors_p)]
+    ax2.plot(Ks*100, [d/1000 for d in diff],
+             color=COLORS['sabr'], linewidth=2.5, label='Cap − Floor')
+    ax2.plot(Ks*100, [s/1000 for s in swaps_p],
+             color=COLORS['rho'], linewidth=1.8, linestyle='--', label='PV(Swap)')
+    ax2.axhline(0, color='black', linewidth=0.6)
+    ax2.set_xlabel('Strike (%)'); ax2.set_ylabel('Valeur (k$)')
+    ax2.set_title('Vérification : Cap − Floor = PV(Swap)'); ax2.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    max_err = max(abs(d - s) for d, s in zip(diff, swaps_p))
+    print(f'Erreur de parité maximale : {max_err:.4f} $  →  parité vérifiée ✓')
+
+
+# ── 9. Comparaison beta = 0 / 0.5 / 1 / libre ────────────────────────────────
+
+def plot_beta_comparison(smiles: list, yield_curve, label: str):
     """
-    Calibrate SABR for several values of β on the same slice and compare:
-      - Left panel  : implied vol smiles
-      - Right panel : residuals (model − market)
+    Compare les smiles calibrées pour β ∈ {0, 0.5, 1, libre} sur une expiry.
+    4 cas : β fixé à 0, 0.5, 1 + β calibré librement comme 4ème paramètre.
     """
-    if betas is None:
-        betas = [0.0, 0.5, 1.0]
+    _apply_style()
 
-    colors = ["steelblue", "darkorange", "seagreen"]
-    labels = [f"β = {b:.1f}" for b in betas]
+    s = next((x for x in smiles if x['label'] == label), None)
+    if s is None:
+        print(f'Label {label} non trouvé.'); return
 
-    T_b   = _parse_tenor(expiry)
-    ten_b = _parse_tenor(tenor)
-    F_b   = yc.swap_rate(T_b, ten_b)
+    F, T      = s['F'], s['expiry']
+    strikes   = np.array(s['strikes'])
+    mkt_vols  = np.array(s['mkt_vols'])
 
-    mkt_b = vol_surface[
-        (vol_surface["expiry"] == expiry) &
-        (vol_surface["tenor"]  == tenor)
-    ].copy()
-    mkt_b["K"] = F_b + mkt_b["strike_spread_bps"] / 10_000.0
-    mkt_b = mkt_b.dropna(subset=["implied_vol"])
-    mkt_b = mkt_b[mkt_b["implied_vol"] > 0]
-
-    strikes_b     = mkt_b["K"].values
-    market_vols_b = mkt_b["implied_vol"].values
-    weights_b     = np.where(mkt_b["strike_spread_bps"].values == 0, 3.0, 1.0)
-
-    print(f"Calibration sur la slice {expiry} × {tenor}  (F = {F_b:.4%})\n")
-    print(f"{'Beta':<8} {'Alpha':>10} {'Rho':>10} {'Nu':>10} {'RMSE':>10}")
-    print("-" * 52)
+    betas     = [0.0, 0.5, 1.0]
+    beta_lbls = ['β=0 (normal)', 'β=0.5 (CIR-like)', 'β=1 (log-normal)']
+    beta_cols = [COLORS['beta0'], COLORS['beta05'], COLORS['beta1']]
 
     params_list = []
     for b in betas:
-        p = calibrate_sabr(
-            F_b, T_b, strikes_b, market_vols_b,
-            beta=b, weights=weights_b, n_restarts=n_restarts,
-        )
+        p = _calibrate_for_beta(F, T, strikes, mkt_vols, beta=b)
         params_list.append(p)
-        print(
-            f"  {b:<6} {p.alpha:>10.6f} {p.rho:>10.6f} "
-            f"{p.nu:>10.6f} {p.rmse * 100:>9.4f}%"
-        )
 
-    bps_grid  = np.linspace(-200, 200, 300)
-    K_grid_b  = F_b + bps_grid / 10_000.0
-    K_grid_b  = K_grid_b[K_grid_b > 0]
-    bps_plot  = (K_grid_b - F_b) * 10_000
-    bps_mkt   = (strikes_b - F_b) * 10_000
+    # Beta libre — 4ème paramètre
+    from sabr import calibrate_sabr_beta_free
+    p_libre = calibrate_sabr_beta_free(F, T, strikes, mkt_vols)
+    params_list.append(p_libre)
+    betas.append(p_libre.beta)
+    beta_lbls.append(f'β libre (β={p_libre.beta:.3f})')
+    beta_cols.append('#7B2D8B')  # violet
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    K_dense = np.linspace(max(strikes.min()*0.7, 0.001), strikes.max()*1.1, 200)
 
-    # ── Left : smiles ───────────────────────────────────────────────────────── #
-    ax = axes[0]
-    for p, color, label in zip(params_list, colors, labels):
-        vols = sabr_vol_vec(F_b, K_grid_b, T_b, p.alpha, p.beta, p.rho, p.nu)
-        ax.plot(bps_plot, vols * 100, color=color, lw=2, label=label)
-
-    ax.scatter(
-        bps_mkt, market_vols_b * 100,
-        color="red", zorder=6, s=60, label="Marché", marker="x", linewidths=2,
-    )
-    ax.axvline(0, ls=":", color="grey", lw=1)
-    ax.set_xlabel("Strike vs ATM (bps)", fontsize=11)
-    ax.set_ylabel("Vol implicite (%)", fontsize=11)
-    ax.set_title(f"Smile SABR — {expiry} × {tenor}\nF = {F_b:.4%}", fontsize=11)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # ── Right : residuals ───────────────────────────────────────────────────── #
-    ax2 = axes[1]
-    for p, color, label in zip(params_list, colors, labels):
-        vols_at_mkt = sabr_vol_vec(F_b, strikes_b, T_b, p.alpha, p.beta, p.rho, p.nu)
-        diff = (vols_at_mkt - market_vols_b) * 100
-        ax2.plot(
-            bps_mkt, diff, color=color, lw=2, marker="o", ms=5,
-            label=f"{label}  (RMSE={p.rmse * 100:.4f}%)",
-        )
-
-    ax2.axhline(0, color="red", ls="--", lw=1)
-    ax2.axvline(0, ls=":", color="grey", lw=1)
-    ax2.set_xlabel("Strike vs ATM (bps)", fontsize=11)
-    ax2.set_ylabel("Erreur modèle − marché (%)", fontsize=11)
-    ax2.set_title("Résidus par beta", fontsize=11)
-    ax2.legend(fontsize=8)
-    ax2.grid(True, alpha=0.3)
-
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
-        f"Impact de β sur la calibration SABR — slice {expiry} × {tenor}",
-        fontsize=13,
+        f'Sensibilité au choix de β — Cap {label}  |  F={F*100:.3f}%\n'
+        r'β définit le backbone du smile : σ_ATM ∝ α/F^{1−β}',
+        fontsize=11, fontweight='bold'
     )
-    fig.tight_layout()
+
+    # Graphe 1 : smiles superposées
+    ax = axes[0]
+    ax.scatter(strikes*100, mkt_vols*100,
+               color=COLORS['market'], s=70, zorder=5,
+               label='Marché', edgecolors='white', linewidths=0.8)
+    for p, lbl, col in zip(params_list, beta_lbls, beta_cols):
+        v = _sabr_vol_vec(F, K_dense, T, p.alpha, p.beta, p.rho, p.nu)*100
+        ax.plot(K_dense*100, v, linewidth=2, color=col,
+                label=f'{lbl}  RMSE={p.rmse*10000:.1f}bps')
+    ax.axvline(F*100, color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+    ax.set_xlabel('Strike (%)'); ax.set_ylabel('Vol implicite (%)')
+    ax.set_title('Smiles calibrées pour β ∈ {0, 0.5, 1}')
+    ax.legend(fontsize=7.5)
+
+    # Graphe 2 : résidus
+    ax = axes[1]
+    for p, lbl, col in zip(params_list, beta_lbls, beta_cols):
+        v_mod = _sabr_vol_vec(F, strikes, T, p.alpha, p.beta, p.rho, p.nu)
+        resid = (v_mod - mkt_vols) * 10000
+        ax.plot(strikes*100, resid, 'o-', color=col, linewidth=1.8,
+                markersize=5, label=lbl)
+    ax.axhline(0, color='black', linewidth=0.8)
+    ax.set_xlabel('Strike (%)'); ax.set_ylabel('Résidu (bps)')
+    ax.set_title('Résidus SABR − marché par β')
+    ax.legend(fontsize=7.5)
+
+    # Graphe 3 : paramètres calibrés
+    ax = axes[2]
+    # Tableau simple
+    table_data = []
+    lbls_table = ['β=0', 'β=0.5', 'β=1', f'β libre']
+    for p, lbl in zip(params_list, lbls_table):
+        table_data.append([lbl, f'{p.beta:.3f}', f'{p.alpha:.5f}',
+                           f'{p.rho:+.4f}', f'{p.nu:.4f}', f'{p.rmse*10000:.1f}'])
+
+    ax.axis('off')
+    tbl = ax.table(
+        cellText=table_data,
+        colLabels=['Cas', 'β', 'α', 'ρ', 'ν', 'RMSE (bps)'],
+        loc='center',
+        cellLoc='center',
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.2, 2.2)
+    ax.set_title('Paramètres calibrés par β', fontweight='bold', pad=20)
+
+    plt.tight_layout()
     plt.show()
+
+    # Interprétation
+    print(f'\nComparaison β — Cap {label}  |  F={F*100:.3f}%')
+    print('-'*60)
+    print(f"{'β':>6}  {'α':>10}  {'ρ':>8}  {'ν':>8}  {'RMSE (bps)':>12}")
+    print('-'*60)
+    for p, b in zip(params_list, betas):
+        print(f"  {b:>4.1f}  {p.alpha:>10.6f}  {p.rho:>+8.4f}  "
+              f"{p.nu:>8.4f}  {p.rmse*10000:>12.2f}")
+    print('-'*60)
+    best_b = betas[np.argmin([p.rmse for p in params_list])]
+    print(f'\nβ optimal : {best_b}  '
+          f'({"normal/Bachelier" if best_b==0 else "racine carrée" if best_b==0.5 else "log-normal"})')
+    print()
+    print('Interprétation :')
+    print(f'  β=0 (normal)    : vol ATM indépendante de F — adapté aux taux bas/négatifs')
+    print(f'  β=0.5 (CIR)     : vol ATM ∝ 1/√F — compromis standard marché')
+    print(f'  β=1 (log-normal): vol ATM ∝ 1/F  — inadapté aux taux très bas USD 2016')
