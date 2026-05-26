@@ -1,10 +1,15 @@
 """
 data_loader.py
 --------------
-Loads market discount factors and swaption volatility quotes from Excel files.
+Lecture des données de marché :
+  - Courbe OIS USD (usdois.xlsx)
+  - Surface de vol implicite caps USD (cap_vol_surface.xlsx)
 
-Swaption vol strikes sheet encodes vols as DIFFERENCES from ATM vol:
-    abs_vol(K) = atm_vol(expiry, tenor) + spread(expiry, tenor, K)
+La surface cap cotait les vols implicites log-normales en % sur une grille
+120 expiries × 19 strikes (0.25% à 11%).
+
+Convention de marché : les expiries 3M–1Y ont des vols identiques ;
+le premier caplet liquide démarre à 1Y sur le marché USD 2016.
 """
 
 import pandas as pd
@@ -12,128 +17,112 @@ import numpy as np
 from pathlib import Path
 
 
-# --------------------------------------------------------------------------- #
-#  Discount factors                                                             #
-# --------------------------------------------------------------------------- #
+# ── Discount factors OIS ──────────────────────────────────────────────────────
 
 def load_discount_factors(path: str | Path) -> pd.DataFrame:
     """
-    Returns a DataFrame with columns ['Date', 'P(0,T)'].
-    Date is parsed as datetime, P(0,T) is float.
+    Retourne un DataFrame avec colonnes ['dates', 'discounts'].
+    dates    : datetime
+    discounts: float — P(0,T)
     """
-    df = pd.read_excel(path, sheet_name="Sheet1", parse_dates=["Date"])
-    df = df.rename(columns={"P(0,T)": "discount_factor"})
-    df = df.sort_values("Date").reset_index(drop=True)
+    df = pd.read_excel(path)
+    df['dates'] = pd.to_datetime(df['dates'])
+    df = df.sort_values('dates').reset_index(drop=True)
     return df
 
 
-# --------------------------------------------------------------------------- #
-#  Swaption ATM vols                                                            #
-# --------------------------------------------------------------------------- #
+# ── Surface de vol caps ────────────────────────────────────────────────────────
 
-def load_atm_vols(path: str | Path) -> pd.DataFrame:
+def load_cap_vol_surface(path: str | Path) -> pd.DataFrame:
     """
-    Returns a tidy DataFrame:
-        expiry (str)  | tenor (str) | atm_vol (float)
+    Retourne la surface de vol caps au format tidy :
+        expiry (str) | strike_pct (float) | implied_vol (float)
 
-    Original sheet has expiries as rows and tenors as columns.
+    implied_vol est en décimal (0.50 = 50%).
+    strikes sont en décimal (0.02 = 2%).
     """
-    raw = pd.read_excel(path, sheet_name="swaption ATM vol", index_col=0)
-    raw.index.name = "expiry"
-    raw.columns.name = "tenor"
+    raw = pd.read_excel(path, index_col=0)
+    raw.index.name = 'expiry'
+    raw.columns.name = 'strike_pct'
+
+    # Convertir les colonnes strike en float (décimal)
+    raw.columns = [float(c) / 100.0 for c in raw.columns]
 
     tidy = (
         raw.stack()
         .reset_index()
-        .rename(columns={0: "atm_vol"})
+        .rename(columns={0: 'implied_vol'})
     )
+    tidy['implied_vol'] = tidy['implied_vol'] / 100.0   # % → décimal
+    tidy = tidy[tidy['implied_vol'] > 0].reset_index(drop=True)
+
     return tidy
 
 
-# --------------------------------------------------------------------------- #
-#  Swaption smile (vol spreads by strike)                                       #
-# --------------------------------------------------------------------------- #
+# ── Smiles filtrées pour calibration ─────────────────────────────────────────
 
-def load_vol_spreads(path: str | Path) -> pd.DataFrame:
+def load_calibration_smiles(
+    path: str | Path,
+    yield_curve,
+    expiry_map: dict,
+    K_min: float = 0.005,
+    K_max: float = 0.06,
+) -> list[dict]:
     """
-    Returns a tidy DataFrame:
-        expiry (str) | tenor (str) | strike_spread_bps (int) | vol_spread (float)
+    Prépare les smiles pour la calibration SABR.
 
-    Strike column headers are in basis points relative to ATM (e.g. -200 = ATM-200bps).
-    Vol values are DIFFERENCES from ATM vol (can be negative).
+    Pour chaque expiry dans expiry_map :
+      - Forward bootstrappé depuis la courbe OIS
+      - Strikes filtrés sur la zone liquide [K_min, K_max]
+      - Vols de marché correspondantes
+
+    Parameters
+    ----------
+    expiry_map : dict label → T en années  (ex: {'1Y': 1.0, '2Y': 2.0, ...})
+    K_min, K_max : filtre de la zone liquide
+
+    Returns
+    -------
+    list of dict : {label, expiry, F, strikes, mkt_vols}
     """
-    raw = pd.read_excel(path, sheet_name="swaption vol strikes")
+    raw = pd.read_excel(path, index_col=0)
+    raw.columns = [float(c) / 100.0 for c in raw.columns]
+    strikes_all = list(raw.columns)
 
-    # First two columns are expiry and tenor; the rest are strike spreads
-    id_cols = raw.columns[:2].tolist()          # ['Expiry Tenor\\Strike', col2] → rename
-    strike_cols = raw.columns[2:].tolist()       # [-200, -100, -50, -25, 25, 50, 100, 200]
+    smiles = []
+    for label, T in expiry_map.items():
+        if label not in raw.index:
+            continue
+        F   = yield_curve.forward_rate(0, T)
+        mkt = raw.loc[label].values / 100.0
 
-    raw = raw.rename(columns={raw.columns[0]: "expiry", raw.columns[1]: "tenor"})
-    raw["expiry"] = raw["expiry"].astype(str).str.strip()
-    raw["tenor"]  = raw["tenor"].astype(str).str.strip()
+        Ks = [K for K, v in zip(strikes_all, mkt) if K_min <= K <= K_max and v > 0.001]
+        Vs = [v for K, v in zip(strikes_all, mkt) if K_min <= K <= K_max and v > 0.001]
 
-    tidy = raw.melt(
-        id_vars=["expiry", "tenor"],
-        value_vars=strike_cols,
-        var_name="strike_spread_bps",
-        value_name="vol_spread",
-    )
-    tidy["strike_spread_bps"] = tidy["strike_spread_bps"].astype(int)
-    return tidy
+        if len(Ks) < 3:
+            continue
 
+        smiles.append({
+            'label'   : label,
+            'expiry'  : T,
+            'F'       : F,
+            'strikes' : Ks,
+            'mkt_vols': Vs,
+        })
 
-# --------------------------------------------------------------------------- #
-#  Combined surface: absolute vols at each strike                               #
-# --------------------------------------------------------------------------- #
-
-def load_full_vol_surface(path: str | Path) -> pd.DataFrame:
-    """
-    Merges ATM vols and spreads to produce absolute implied vols at every strike.
-
-    Returns a tidy DataFrame:
-        expiry | tenor | strike_spread_bps | atm_vol | vol_spread | implied_vol
-    """
-    atm   = load_atm_vols(path)
-    spreads = load_vol_spreads(path)
-
-    # ATM entry has zero spread
-    atm_entry = atm.copy()
-    atm_entry["strike_spread_bps"] = 0
-    atm_entry["vol_spread"] = 0.0
-
-    # Merge spreads with ATM to get absolute vols
-    merged = spreads.merge(atm, on=["expiry", "tenor"], how="left")
-    merged["implied_vol"] = merged["atm_vol"] + merged["vol_spread"]
-
-    # Append ATM strikes
-    atm_entry["implied_vol"] = atm_entry["atm_vol"]
-    full = pd.concat([merged, atm_entry], ignore_index=True)
-    full = full.sort_values(["expiry", "tenor", "strike_spread_bps"]).reset_index(drop=True)
-
-    return full
+    return smiles
 
 
-# --------------------------------------------------------------------------- #
-#  Quick sanity check                                                           #
-# --------------------------------------------------------------------------- #
+# ── Sanity check ──────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    base = Path(__file__).parent / "data"
-    df_path  = base / "market_discount_factors.xlsx"
-    sw_path  = base / "swaption_quotes.xlsx"
+if __name__ == '__main__':
+    base = Path(__file__).parent
 
-    print("=== Discount Factors ===")
-    df = load_discount_factors(df_path)
+    df = load_discount_factors(base / 'usdois.xlsx')
+    print('=== OIS ===')
     print(df.head())
 
-    print("\n=== ATM Vols ===")
-    atm = load_atm_vols(sw_path)
-    print(atm.head(15))
-
-    print("\n=== Vol Spreads ===")
-    sp = load_vol_spreads(sw_path)
-    print(sp.head(15))
-
-    print("\n=== Full Surface (sample) ===")
-    surf = load_full_vol_surface(sw_path)
-    print(surf[surf.expiry == "5y"].head(20))
+    surf = load_cap_vol_surface(base / 'cap_vol_surface.xlsx')
+    print('\n=== Surface vol caps (sample) ===')
+    print(surf[surf['expiry'] == '2Y'].head(10))
+    print(f'\nDimension : {surf.shape[0]} observations')
