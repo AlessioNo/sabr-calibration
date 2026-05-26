@@ -3,7 +3,7 @@ data_loader.py
 --------------
 Lecture des données de marché :
   - Courbe OIS USD (usdois.xlsx)
-  - Surface de vol implicite caps USD (cap_vol_surface__1_.xlsx)
+  - Surface de vol implicite caps USD (cap_vol_surface.xlsx)
 
 La surface cap cotait les vols implicites log-normales en % sur une grille
 120 expiries × 19 strikes (0.25% à 11%).
@@ -122,7 +122,7 @@ if __name__ == '__main__':
     print('=== OIS ===')
     print(df.head())
 
-    surf = load_cap_vol_surface(base / 'cap_vol_surface__1_.xlsx')
+    surf = load_cap_vol_surface(base / 'cap_vol_surface.xlsx')
     print('\n=== Surface vol caps (sample) ===')
     print(surf[surf['expiry'] == '2Y'].head(10))
     print(f'\nDimension : {surf.shape[0]} observations')
